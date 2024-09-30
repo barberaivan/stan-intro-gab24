@@ -34,4 +34,4 @@ paquetes instalados:
 Se recomienda seguir el taller usando el archivo `modelos.Rmd`. En caso de usar
 RStudio, lo ideal es tener una versión $\ge$ 1.4 para usar el modo de
 edición "visual", así el texto se diferencia mejor del código y las
-ecuaciones se ven como se debe.
+ecuaciones se ven como se debe. En caso de no contar con los paquetes al día para ir corriendo el código, se puede abrir el archivo `modelos.html` en un navegador para ver el código desde cerca.
