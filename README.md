@@ -31,7 +31,7 @@ paquetes instalados:
 - ggdensity
 - viridis.
 
-Se recomienda seguir el taller usando el archivo .Rmd. En caso de usar
-RStudio, lo ideal es tener una versión $\ge$ 1.4 para usar el modo de
+Se recomienda seguir el taller usando el archivo `modelos.Rmd`. En caso de usar
+RStudio, lo ideal es tener una versión $\ge$1.4 para usar el modo de
 edición "visual", así el texto se diferencia mejor del código y las
 ecuaciones se ven como se debe.
