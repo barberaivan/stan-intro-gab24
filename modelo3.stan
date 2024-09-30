@@ -1,8 +1,8 @@
 data {
-  int nt;
-  int nf;
-  int y[nt*nf];
-  int x[nt, nf];
+  int<lower=0> nt;
+  int<lower=0> nf;
+  array[nt*nf] int y;
+  array[nt, nf] int x;
 
   // parámetros que definen las previas (conocidos, por eso van en data)
   real alpha_mu;

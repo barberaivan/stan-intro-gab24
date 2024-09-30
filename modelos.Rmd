@@ -1,0 +1,1609 @@
+---
+title: "Deconstruir el modelado no eStan complicado. Una introducción a Stan"
+author: "Iván Barberá"
+date: "2024-09-29"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 4
+    theme: lumen
+html_notebook:
+    df_print: paged
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 4
+    theme: lumen
+editor_options:
+  chunk_output_type: inline
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,fig.width = 18/2.4, fig.height = 12/2.4)
+cmdstanr::register_knitr_engine(override = FALSE)
+
+# Paquetes ----------------------------------------------------------------
+
+library(tidyverse) # ggplot y mucho más
+library(ggdensity) # geom_hdr
+library(viridis)   # colores
+library(rstan)     # Stan
+library(bbmle)     # estimación por maximum likelihood
+library(DHARMa)    # residuos
+
+theme_set(theme_classic())
+
+# Funciones ---------------------------------------------------------------
+
+# Para normalizar densidades o likelihoods (con fines gráficos).
+# area es el tamaño del segmento o celda en la aproximación discreta.
+# En 1D, es la distancia entre valores de la secuencia de parámetros.
+# En 2D, es el área de cada celda.
+# Devuelve un vector de densidad o likelihood, tal que
+# sum(normalized_density * area) ~= 1
+normalize_dens <- function(dens, area) {
+  dens / sum(dens * area)
+}
+
+# resumir muestras de una distribución con media e intervalo de credibilidad,
+# con probabilidad definida por ci
+mean_ci <- function(x, ci = 0.95) {
+  out <- 1 - ci
+  qq <- quantile(x, probs = c(out / 2, ci + out / 2), method = 8) %>% unname
+  return(c("mean" = mean(x), "lower" = qq[1], "upper" = qq[2]))
+}
+
+# logit y logit inverso con nombres claros
+logit <- function(x) qlogis(x)       # = log(x / (1 - x))
+inv_logit <- function(x) plogis(x)   # = 1 / (1 + exp(-x))
+
+# Tema elegante para ggplot
+nice_theme <- function() {
+  theme(
+    panel.border = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major =  element_line(),
+
+    axis.line = element_line(linewidth = 0.35),
+
+    axis.text = element_text(size = 9),
+    axis.title = element_text(size = 11),
+
+    strip.text = element_text(size = 11),
+    strip.background = element_rect(fill = "white", color = "white")
+  )
+}
+
+# Datos y constantes ----------------------------------------------------
+
+d <- read.csv("datos_ballenas.csv")
+ncores <- min(parallel::detectCores() - 1, 4)
+```
+
+## Relación entre likelihood y distribución
+
+Supongamos un modelo muy simple: respuesta binaria con distribución
+Bernoulli: $$y_i \sim \text{Bernoulli}(\theta),$$ donde la función de
+masa de probabilidad Bernoulli se define así:
+$$\text{Pr}(Y=y) = \theta^y(1-\theta)^{1-y},$$ con $y \in \{0, 1\}$,
+siendo $\theta$ la probabilidad de éxito. Si fijamos $\theta$, obtenemos
+la función de masa de probabilidad, y si fijamos $y$, obtenemos la
+función de likelihood.
+
+```{r}
+xcat <- as.factor(0:1)
+
+par(mfrow = c(1, 2))
+barplot(dbinom(0:1, prob = 0.3, size = 1) ~ xcat,
+        xlab = "y", ylab = "Pr(Y=y)", ylim = c(0, 1),
+        main = "Función de masa de\nprobabilidad",
+        cex.main = 1, font.main = 1)
+text(xcat[2], 0.8, expression(theta == 0.3))
+
+curve(dbinom(1, prob = x, size = 1), xlab = expression(theta), n = 300,
+      ylab = "Pr(Y=y)",
+      main = "Función de likelihood\npara una observación",
+      cex.main = 1, font.main = 1)
+curve(dbinom(0, prob = x, size = 1), add = TRUE, lty = 2)
+text(0.8, 0.9, "y=1")
+text(0.2, 0.9, "y=0")
+par(mfrow = c(1, 1))
+```
+
+La función de masa suma 1, o integra 1 si la variable aleatoria (Y) es
+continua. En ese caso, hablamos de función de densidad. La función de
+likelihood no es una distribución, y puede o no integrar 1. Cuando
+tenemos más de una observación, calculamos la likelihood conjunta de
+todas ellas, y como generalmente asumimos independencia, es simplemente
+el producto de las likelihoods individuales. Acá vemos la likelihood
+para dos observaciones, $\boldsymbol{y} = \{0, 1\}$.
+
+```{r}
+yylab <- expression(paste("Pr(", bold(y), " | ", theta, ")", sep = ""))
+curve(dbinom(0, prob = x, size = 1) *
+        dbinom(1, prob = x, size = 1),
+      xlab = expression(theta), n = 300,
+      ylab = yylab,
+      main = "Función de likelihood",
+      cex.main = 1, font.main = 1)
+```
+
+Y a medida que agregamos datos, la función de likelihood se hace más
+puntuda. Ahora graficamos la likelihood para 7 observaciones,
+$\boldsymbol{y} = \{0, 1, 0, 0, 0, 1, 1\}$.
+
+```{r}
+y <- c(0, 1, 0, 0, 0, 1, 1)
+nseq <- 300
+theta_seq <- seq(0, 1, length.out = nseq)
+like <- numeric(nseq)
+for(i in 1:nseq) like[i] <- prod(dbinom(y, size = 1, prob = theta_seq[i]))
+
+yylab <- expression(paste("Pr(", bold(y), " | ", theta, ")", sep = ""))
+
+plot(like ~ theta_seq, type = "l",
+     xlab = expression(theta),
+     ylab = yylab,
+     main = "Función de likelihood",
+     cex.main = 1, font.main = 1)
+```
+
+## Likelihood, previa y posterior
+
+Ahora usaremos otro ejemplo para calcular la likelihood, previa y
+posterior: datos con distribución normal, estimando únicamente media y
+varianza (modelo de la media):
+
+$$
+\begin{aligned}
+y_i &\sim \text{Normal}(\mu, \sigma) \\
+\mu &\sim \text{Normal}(0, 5) \\
+\sigma &\sim \text{Gamma}(2, 2). 
+\end{aligned}
+$$ Y asumimos que observamos $\boldsymbol{y} = \{1.5, 0.8, 1.1\}$.
+
+```{r}
+y <- c(1.5, 0.8, 1.1)
+```
+
+Necesitamos calcular la densidad (=probabilidad) posterior para cada
+combinación posible de $\mu$ y $\sigma$.
+$$\text{posterior} \propto \text{likelihood} \times \text{previa}.$$
+
+A modo de ejemplo, definimos valores arbitrarios para los parámetros, y
+hacemos las cuentas con ellos.
+
+```{r}
+mu_try <- 1
+sigma_try <- 1.2
+```
+
+Likelihood:
+
+```{r}
+l1 <- dnorm(1.5, mu_try, sigma_try)
+l2 <- dnorm(0.8, mu_try, sigma_try)
+l3 <- dnorm(1.1, mu_try, sigma_try)
+
+like = l1 * l2 * l3
+
+curve(dnorm(x, mu_try, sigma_try), from = -4, to = 4,
+      ylab = "Likelihood", xlab = "Y")
+abline(v = y, lty = 2)
+```
+
+Y si ponemos previas independientes para cada parámetro, la previa
+conjunta es el producto de las previas.
+
+```{r}
+prior_mu <- dnorm(mu_try, 0, 5) 
+prior_sigma <- dgamma(sigma_try, 2, 2) 
+
+prior <- prior_mu * prior_sigma
+
+curve(dnorm(x, 0, 5), from = -15, to = 15, ylab = "Previa", 
+      xlab = expression(mu)) 
+abline(v = mu_try, lty = 2)
+
+curve(dgamma(x, 2, 2), to = 8, ylab = "Previa", 
+      xlab = expression(sigma)) 
+abline(v = sigma_try, lty = 2)
+```
+
+Y la densidad posterior es simplemente
+
+```{r}
+(posterior <- like * prior)
+```
+
+Y ahora lo hacemos de forma más compacta
+
+```{r}
+posterior <- prod(dnorm(y, mu_try, sigma_try)) * # likelihood
+             dnorm(mu_try, 0, 5) *               # previas
+             dgamma(sigma_try, 2, 2)
+
+log_posterior <- sum(dnorm(y, mu_try, sigma_try, log = T)) +
+                 dnorm(mu_try, 0, 5, log = T) +
+                 dgamma(sigma_try, 2, 2, log = T)
+
+```
+
+También podemos crear una función que evalúe la log-posterior para
+cualquier valor de $\mu$ y $\sigma$:
+
+```{r}
+
+target <- function(mu, sigma, like_only = F) {
+  log_like <- sum(dnorm(y, mu, sigma, log = T))
+  
+  if(like_only) {
+    return(log_like)
+  } else {
+    log_prior <- dnorm(mu, 0, 5, log = T) + dgamma(sigma, 2, 2, log = T)
+    log_posterior <- log_like + log_prior
+    return(log_posterior)
+  }
+}
+
+target(mu = 1, sigma = 100)
+target(mu = 1, sigma = 3)
+target(mu = 1, sigma = 3, like_only = T)
+```
+
+## Modelo 1: y \~ 1
+
+Comenzamos a analizar los datos de comportamiento de ballenas ajustando
+el modelo más simple posible:
+
+$$
+\begin{aligned}
+y_i &\sim \text{Bernoulli}(\theta) \\
+\theta &\sim \text{Unif}(0, 1)
+\end{aligned}
+$$
+
+La likelihood de una Bernoulli es igual a la de una Binomial con N = 1,
+así que usaremos la función de R `dbinom(..., size = 1)`. Empezaremos
+estimando el valor de $\theta$ que maximiza la likelihood, usando el
+método de la grilla.
+
+```{r}
+# función que evalúe la likelihood para cualquier valor de theta.
+# ll por log-likelihood
+ll1 <- function(theta) {
+  sum(dbinom(d$y, size = 1, prob = theta, log = T))
+}
+
+# versión vectorizada, para darle una secuencia de theta
+ll1vec <- function(theta) {
+  ll <- numeric(length(theta))
+  for(i in 1:length(theta)) {
+    ll[i] <- ll1(theta[i])
+  }
+  return(ll)
+}
+
+# graficamos para una secuencia fina de theta
+theta_seq <- seq(0, 1, length.out = 10000)
+ll_seq <- ll1vec(theta_seq)
+plot(ll_seq ~ theta_seq, type = "l", ylab = "Log-Likelihood",
+     xlab = expression(theta))
+plot(exp(ll_seq) ~ theta_seq, type = "l", ylab = "Likelihood",
+     xlab = expression(theta))
+
+# MLE:
+row_optim <- which.max(ll_seq)
+(theta_hat1 <- theta_seq[row_optim])
+```
+
+Pero una forma más generalizable a modelos más complejos implica usar
+una función de optimización, como `mle2` del paquete `bbmle`.
+
+```{r}
+#  Función que devuelva la -log_likelihood, porque mle2 busca mínimos.
+ll1_neg <- function(theta) -ll1(theta)
+
+m1_mle <- mle2(ll1_neg,              # función de -log_likelihood
+               list(theta = 0.5),    # valores iniciales
+               method = "Brent",     # método de optimización, para 1D
+               lower = 0, upper = 1) # límites del parámetro
+summary(m1_mle)
+coef(m1_mle)
+bbmle::confint(m1_mle, level = 0.95)
+
+# ploteamos
+plot(exp(ll_seq) ~ theta_seq, type = "l", ylab = "Likelihood",
+     xlab = expression(theta), xlim = c(0.2, 0.6))
+# estimación a mano vs. la de mle2
+abline(v = c(theta_hat1, coef(m1_mle)), col = c("gray60", "red"),
+       lty = 1:2, lwd = c(5, 1))
+
+```
+
+Ahora estimaremos la posterior, que es una distribución, no un estimador
+puntual. Como asumimos previa Unif(0, 1), y su densidad es siempre 1, la
+posterior no normalizada es igual a la función de likelihood.
+
+```{r}
+# posterior no normalizada, "un" por unnomalized (no integra 1)
+lp_un <- ll1vec(theta_seq) + dunif(theta_seq, log = T)
+
+par(mfrow = c(1, 2))
+plot(ll_seq ~ theta_seq, type = "l", ylab = "Log-Likelihood",
+     xlab = expression(theta))
+plot(lp_un ~ theta_seq, type = "l", ylab = "Log-Posterior no normalizada",
+     xlab = expression(theta))
+par(mfrow = c(1, 1))
+
+par(mfrow = c(1, 2))
+plot(exp(ll_seq) ~ theta_seq, type = "l", ylab = "Likelihood",
+     xlab = expression(theta))
+plot(exp(lp_un) ~ theta_seq, type = "l", ylab = "Posterior no normalizada",
+     xlab = expression(theta))
+par(mfrow = c(1, 1))
+```
+
+Para caracterizar esta distribución con medidas de resumen es más fácil
+aproximarla con muestras. En este caso, usaremos una aproximación
+discreta para que sea más intuitivo: asumimos que el parámetro puede
+tomar sólo los valores definidos en una secuencia fina, y los
+remuetreamos con probabilidad proporcional a la posterior usando
+`sample`.
+
+```{r}
+npost <- 10000 # nro de muestras a tomar
+ids_post <- sample(1:length(theta_seq), size = npost, replace = T,
+                   prob = exp(lp_un))
+theta_draws <- theta_seq[ids_post]
+
+# Ahora ploteamos la posterior normalizada, aproximada por la secuencia y
+# la posterior aproximada por muestras
+
+# normalizamos la secuencia
+area <- diff(theta_seq[1:2])
+dpost <- normalize_dens(exp(lp_un), area)
+
+# Posterior analítica de la aproximación discreta
+plot(dpost ~ theta_seq, type = "l", ylab = "Posterior normalizada",
+     xlab = expression(theta), lwd = 5, col = "gray60")
+
+# Densidad empírica de la posterior aproximada con muestras
+lines(density(theta_draws, from = 0, to = 1, n = 2^10), col = "blue", lty = 2)
+
+# Previa
+lines(dunif(theta_seq) ~ theta_seq, col = "red")
+```
+
+Y obtenemos algunas medidas de resumen.
+
+```{r}
+mean_ci(theta_draws, ci = 0.80) # media e intervalo del 80 %
+mean_ci(theta_draws, ci = 0.95) # media e intervalo del 95 %
+
+# Pr(theta > 0.3):
+sum(theta_draws > 0.3) / npost
+
+# Pr(0.3 < theta < 0.32)
+sum(theta_draws > 0.3 & theta_draws < 0.32) / npost
+```
+
+Nuevamente, este método de muestreo es muy ineficiente, y sólo puede
+usarse cuando el modelo tiene muy pocos parámetros. Entonces ahora
+muestrearemos la posterior con Stan, un software que aplica un algoritmo
+de muestreo llamado Hamiltonian Monte Carlo (HMC), que está entre los
+más eficientes que existen por el momento. Para muestrear una posterior
+con Stan necesitamos escribir el modelo en lenguaje Stan, en un archivo
+.stan, y luego, desde R, compilar el modelo y correr el HMC. Además,
+necesitamos empaquetar los datos en una lista.
+
+El modelo está definido en el archivo `modelo1.stan`, pero aquí veremos
+sus partes en detalle. El código de Stan se organiza en los siguientes
+bloques:\
+- `functions`\
+- `data`\
+- `transformed data`\
+- `parameters`\
+- `transformed parameters`\
+- `model`\
+- `generated quantities`
+
+Como mínimo, tienen que definirse los parámetros, en `parameters`, y la
+densidad posterior en `model`, pero el uso habitual incluye el uso de
+datos, así que como mínimo se incluye algo en `data` (porque la
+posterior sin datos es la previa).
+
+Veamos la sección `data` del modelo 1:
+
+```{stan, output.var="tst_chunk", eval=FALSE}
+data {
+  int<lower=0> n;
+  array[n] int y;
+}
+```
+
+Tenemos que declarar las variables, indicando su clase. Ahí definimos n,
+el número de observaciones e $y$, como un array de enteros de largo n.
+Nótese que al final de cada línea hay que poner ";". Luego sigue la
+sección `parameters`, en donde simplemente declaramos a $\theta$,
+indicando que es un real y que sólo puede tomar valores entre 0 y 1.
+
+```{stan, output.var="tst_chunk", eval=FALSE}
+parameters {
+  real<lower=0, upper=1> theta;
+}
+```
+
+Y por último, en la sección `model` indicamos cómo calcular la
+log-posterior.
+
+```{stan, output.var="tst_chunk", eval=FALSE}
+model {
+  // Previa
+  theta ~ uniform(0, 1);
+
+  // Likelihood
+  y ~ bernoulli(theta);
+}
+```
+
+("//" se usa para comentarios, no "\#"). Stan va a recorrer el espacio
+de parámetros, que tiene tantas dimensiones como lo que definimos en
+`parameters`, y tomará muestras de forma proporcional a la densidad
+posterior. Entonces, lo que hacemos en el bloque `model` es indicar cómo
+calcular esa log-posterior no normalizada. Si tuviéramos que traducilo a
+`R`, llamando `target` a la log-posterior, escribiríamos esto:
+
+```{r, eval=FALSE}
+target <- 0 # simplemente la iniciamos.
+
+# sumamos la log-previa
+target <- target + dunif(theta, 0, 1, log = T)
+
+# sumamos la log-likelihood
+target <- target + sum(dbinom(y, size = 1, prob = theta, log = T))
+```
+
+Y en Stan también puede escribirse de forma similar. Los enunciados de
+arriba que usan el símbolo $\sim$ simplemente son una forma de indicar
+"agregá este término a la log-posterior". Y en Stan, el objeto `target`
+es quien registra esa variable:
+
+```{stan, output.var="tst_chunk", eval=FALSE}
+model {
+  // Previa
+  target += uniform_lpdf(theta | 0, 1);
+
+  // Likelihood
+  target += bernoulli_lpmf(y | theta);
+}
+```
+
+(El operador `+=` es un atajo para la expresión análoga en R). Si bien
+esta forma es más verborrágica, ayuda a entender mejor qué hace Stan.
+Los sufijos `_lpdf`y `_lpmf` se refieren a Log Probability Density
+Function y Log Probability Mass Function. Como la uniforme es continua,
+tiene función de densidad, mientras que la Bernoulli es discreta,
+entonces tiene función de masa.
+
+Ahora sí, compilamos y muestreamos.
+
+```{r}
+# compilamos el modelo
+smodel1 <- stan_model("modelo1.stan", verbose = F)
+
+# preparamos datos
+sdata1 <- list(n = nrow(d), y = d$y)
+
+# muestreamos
+m1 <- sampling(
+  smodel1, data = sdata1, seed = 9663,
+  cores = ncores, chains = 4, iter = 2000, warmup = 1000
+)
+
+# Chequeamos convergencia y calidad de las muestras
+sm1 <- summary(m1)[[1]]
+sm1["theta", c("n_eff", "Rhat")]
+# Rhat debe ser < 1.01
+# n_eff debe ser al menos > 400, pero idealmente > 1000
+```
+
+Estando seguros de que el algoritmo convirgió y que tenemos un número
+efectivo de muestras adecuado, graficamos la posterior, comparando con
+el enfoque anterior.
+
+```{r}
+# Extraemos muestras y graficamos la posterior
+theta_draws_stan <- as.matrix(m1)[, "theta", drop = T]
+
+# Las mismas posteriores de antes
+plot(dpost ~ theta_seq, type = "l", ylab = "Posterior normalizada",
+     xlab = expression(theta), lwd = 5, col = "gray60")
+lines(density(theta_draws, from = 0, to = 1, n = 2^10), col = "blue", lty = 2)
+# Lo que muestreó Stan:
+lines(density(theta_draws_stan, from = 0, to = 1, n = 2^10), 
+      col = "green", lty = 2)
+
+# Comparamos estimación de Stan con MLE
+c(coef(m1_mle), bbmle::confint(m1_mle, level = 0.95))
+mean_ci(theta_draws_stan, ci = 0.95)
+```
+
+Aprovechando la simpleza del modelo, lo usaremos para explorar
+gráficamente el efecto de distintas previas.
+
+Usaremos una previa Beta, que está definida en [0, 1]. La previa estará
+normalizada (su área integra 1), pero la likelihood no. Esto hace que
+tengan escalas muy distintas, lo que dificulta compararlas. Para
+resolver este problema, normalizaremos la likelihood y la posterior,
+usando la función `normalize_dens`. Nótese que esto es necesario sólo
+para poder compararlas gráficamente.
+
+```{r}
+# parámetros de la previa (para jugar, pero que ambos sean positivos)
+a <- 1
+b <- 6
+
+prior <- dbeta(theta_seq, a, b)  # normalizada
+log_like <- ll1vec(theta_seq)    # no normalizada, porque no es una
+                                 #  distribución
+log_post <- log(prior) + log_like # no normalizada aún.
+
+# Convertimos a escala de probabilidad (a partir de la log-probabilidad) y
+# normalizamos
+like <- normalize_dens(exp(log_like), area)
+post <- normalize_dens(exp(log_post), area)
+
+# Graficamos
+ymax <- max(c(like, post, prior)) * 1.05
+plot(prior ~ theta_seq, type = "l", col = "red", ylim = c(0, ymax),
+     ylab = "Densidad o likelihood", xlab = expression(theta))
+lines(like ~ theta_seq, col = "blue")
+lines(post ~ theta_seq, col = "black")
+text(0.9, ymax * 0.95, "Previa", col = "red")
+text(0.9, ymax * 0.85, "Likelihood", col = "blue")
+text(0.9, ymax * 0.75, "Posterior", col = "black")
+
+```
+
+## Modelo 2: y \~ z
+
+Para seguir complejizando el modelo fingiremos haber observado la
+predictora latente, z. Esto permite ajustar un modelo un poco más
+divertido que usar el ataque (x) como predictora, ya que el ataque es
+binario.
+
+$$
+\begin{aligned}
+y_i &\sim \text{Bernoulli}(\theta_i) \\
+\theta_i &= \text{logit}^{-1}(\alpha + \beta \ z_i) \\
+\alpha &\sim \text{Normal}(0, 5) \\
+\beta &\sim \text{Normal}(0, 2)
+\end{aligned}
+$$
+
+Donde el logit y su inversa se definen así:
+
+$$
+\begin{aligned}
+\text{logit}^{-1}(x) &= \frac{1}{1 + \exp(-x)}, \\
+\text{logit}(x) &= \frac{x}{1-x}. \\
+\end{aligned}
+$$ Comenzamos escribiendo la función de likelihood:
+
+```{r}
+ll2 <- function(alpha, beta) {
+  # calculamos theta en base a alpha, beta y z. Ahora theta no es un parámetro,
+  # sino una cantidad derivada
+  theta <- inv_logit(alpha + beta * d$z) # función logística, que restringe a
+                                         # theta en [0, 1]
+  ll <- sum(dbinom(d$y, size = 1, prob = theta, log = T))
+  return(ll)
+}
+
+# versión vectorizada, para darle vectores de alpha y beta
+ll2vec <- function(alpha, beta) {
+  ll <- numeric(length(alpha))
+  for(i in 1:length(alpha)) {
+    ll[i] <- ll2(alpha[i], beta[i])
+  }
+  return(ll)
+}
+```
+
+y la graficamos.
+
+```{r}
+# Creamos una grilla de alpha y beta, pero lo ordenamos en una tabla,
+# usando expand.grid
+nside <- 250 # número de valores por parámetro. 
+# OJO: la grilla tendrá nside ^ 2 valores
+
+# El rango de valores debería abarcar todo lo que sería razonable.
+alpha_seq <- seq(-4, 4, length.out = nside)
+beta_seq <- seq(-4, 4, length.out = nside)
+
+partable <- expand.grid(alpha = alpha_seq,
+                        beta = beta_seq)
+
+partable$log_like <- ll2vec(partable$alpha, partable$beta)
+
+# normalizamos, para luego poder comparar con la previa y la posterior.
+area <- diff(alpha_seq[1:2]) * diff(beta_seq[1:2])
+partable$like_norm <- normalize_dens(exp(partable$log_like), area = area)
+
+ggplot(partable, aes(x = alpha, y = beta, fill = like_norm)) +
+  geom_tile() +
+  scale_fill_viridis() +
+  labs(fill = "Likelihood") +
+  xlab(expression(alpha)) +
+  ylab(expression(beta))
+```
+
+Obtenemos el MLE a mano,
+
+```{r}
+row_optim <- which.max(partable$log_like)
+(coef_hat1 <- partable[row_optim, c("alpha", "beta")])
+```
+
+y también usando la función `mle2`:
+
+```{r}
+ll2_neg <- function(alpha, beta) -ll2(alpha, beta)
+
+m2_mle <- mle2(ll2_neg,                   # función de -log_likelihood
+               start = list(alpha = 0, beta = 0), # valores iniciales
+               lower = list(alpha = -Inf, beta = -Inf),
+               upper = list(alpha = Inf, beta = Inf),
+               method = "L-BFGS-B") 
+# Ese método permite poner límites en más de 1D.
+# En este caso es absurdo poner límites, pero sirve de ejemplo.
+
+summary(m2_mle) # HAY ESTRELLITAS
+coef(m2_mle)
+bbmle::confint(m2_mle, level = 0.95)
+```
+
+Graficamos la superficie de la likelihood con ambas estimaciones.
+
+```{r}
+# Metemos ambas estimaciones en un data.frame para ggplot
+coef_hat_table <- data.frame(
+  alpha = c(coef_hat1[1, 1], coef(m2_mle)[1]),
+  beta = c(coef_hat1[1, 2], coef(m2_mle)[2]),
+  metodo = c("grilla", "mle2")
+)
+
+# ploteamos nuevamente, pero haciendo zoom sobre la zona no-nula de la
+# likelihood e incluyendo las estimaciones puntuales
+ggplot(partable, aes(x = alpha, y = beta, fill = like_norm)) +
+  geom_tile() +
+  scale_fill_viridis() +
+  labs(fill = "Likelihood") +
+  xlab(expression(alpha)) +
+  ylab(expression(beta)) +
+  # agregamos las estimaciones puntuales
+  geom_point(data = coef_hat_table, aes(alpha, beta, shape = metodo),
+             inherit.aes = F, size = 4) +
+  scale_shape_manual(values = c(1, 4)) +
+  xlim(-3, -1) + # esto hace zoom
+  ylim(1.5, 3.8)
+```
+
+Ahora graficaremos de esta forma la likelihood, la previa y la
+posterior. La idea es probar distintas previas, a ver qué efecto tienen.
+
+```{r}
+# Parámetros de las previas
+alpha_mu <- 0
+alpha_sigma <- 0.25
+
+beta_mu <- 2
+beta_sigma <- 0.25
+
+# Previa
+partable$log_prior <-
+  dnorm(partable$alpha, mean = alpha_mu, sd = alpha_sigma, log = T) +
+  dnorm(partable$beta, mean = beta_mu, sd = beta_sigma, log = T)
+partable$prior <- exp(partable$log_prior)
+
+# Posterior
+partable$log_post <- partable$log_like + partable$log_prior
+partable$post <- normalize_dens(exp(partable$log_post), area)
+
+# Ordenamos para plotear
+nn <- which(names(partable) %in% c("like_norm", "prior", "post"))
+ptlong <- pivot_longer(partable,
+                       cols = all_of(nn), names_to = "var",
+                       values_to = "densidad")
+ptlong$var <- factor(ptlong$var, levels = c("like_norm", "prior", "post"),
+                     labels = c("Likelihood", "Previa", "Posterior"))
+
+ggplot(ptlong, aes(x = alpha, y = beta, fill = densidad)) +
+  geom_tile(na.rm = T) +
+  scale_fill_viridis(na.value = "transparent") +
+  labs(fill = "Densidad") +
+  facet_wrap(vars(var), nrow = 2, axes = "all", axis.labels = "margins") +
+  xlab(expression(alpha)) +
+  ylab(expression(beta)) +
+  theme(strip.background = element_rect(color = "white"),
+        legend.position.inside = c(0.75, 0.25)) +
+  xlim(-3, 1.75) +
+  ylim(1, 3.8)
+```
+
+### Muestreo de la posterior
+
+Primero, a mano, con el método de la grilla.
+
+```{r}
+# Volvemos a definir previas, así nos independizamos de las elecciones que
+# hicimos para el gráfico. También hay que recalcular la posterior
+
+alpha_mu <- 0
+alpha_sigma <- 5
+beta_mu <- 0
+beta_sigma <- 2
+
+# Previa
+partable$log_prior <-
+  dnorm(partable$alpha, mean = alpha_mu, sd = alpha_sigma, log = T) +
+  dnorm(partable$beta, mean = beta_mu, sd = beta_sigma, log = T)
+partable$prior <- exp(partable$log_prior)
+
+# Posterior
+partable$log_post <- partable$log_like + partable$log_prior
+partable$post <- normalize_dens(exp(partable$log_post), area)
+
+# Igual que antes, sorteamos filas de partable según la probabilidad posterior.
+npost <- 10000
+ids_post <- sample(1:nrow(partable), size = npost, replace = T,
+                   prob = partable$post)
+m2_draws_hand <- as.matrix(partable[ids_post, c("alpha", "beta")])
+```
+
+Y ahora, con Stan. Definimos el modelo así (guardado en `modelo2.stan`):
+
+```{stan, output.var="tst_chunk", eval=FALSE}
+data {
+  int<lower=0> n;
+  array[n] int y;
+  vector[n] z;
+
+  // parámetros que definen las previas (conocidos, por eso van en data)
+  real alpha_mu;
+  real alpha_sigma;
+  real beta_mu;
+  real beta_sigma;
+}
+
+parameters {
+  real alpha;
+  real beta;
+}
+
+transformed parameters {
+  // theta ya no es un parámetro, sino una cantidad derivada, por eso va
+  // en este bloque. Y como theta varía con z, ya no es un escalar (real), sino
+  // un vector de largo n.
+  vector[n] theta = inv_logit(alpha + beta * z);
+  // no hace falta restringir a theta explícitamente con
+  // vector<lower=0, upper=1>[n] porque inv_logit asegura eso.
+}
+
+model {
+  // Previas sobre los parámetros, no sobre theta
+  alpha ~ normal(alpha_mu, alpha_sigma);
+  beta ~ normal(beta_mu, beta_sigma);
+
+  // Likelihood
+  y ~ bernoulli(theta);
+}
+```
+
+Compilamos y muestreamos.
+
+```{r}
+# compilamos el modelo
+smodel2 <- stan_model("modelo2.stan", verbose = F)
+
+# preparamos datos
+sdata2 <- list(
+  n = nrow(d), y = d$y, z = d$z,
+  alpha_mu = alpha_mu,
+  alpha_sigma = alpha_sigma,
+  beta_mu = beta_mu,
+  beta_sigma = beta_sigma
+)
+
+# muestreamos
+m2 <- sampling(
+  smodel2, data = sdata2, seed = 9663,
+  cores = ncores, chains = 4, iter = 2000, warmup = 1000
+)
+
+# Chequeamos convergencia y calidad de las muestras
+sm2 <- summary(m2)[[1]]
+sm2[c("alpha", "beta"), c("n_eff", "Rhat")]
+```
+
+Extraemos muestras y graficamos
+
+```{r}
+m2_draws <- as.matrix(m2, pars = c("alpha", "beta"))
+
+# Comparamos muestreo a mano con el de Stan
+
+# Distribuciones marginales
+par(mfrow = c(1, 2))
+plot(density(m2_draws[, "alpha"]), main = NA, xlab = expression(alpha))
+lines(density(m2_draws_hand[, "alpha"]), col = "blue")
+
+plot(density(m2_draws[, "beta"]), main = NA, xlab = expression(beta))
+lines(density(m2_draws_hand[, "beta"]), col = "blue")
+par(mfrow = c(1, 1))
+```
+
+Además de mirar la distribución marginal de cada parámetro, podemos ver
+la conjunta (una distribución bivariada)
+
+```{r}
+# Distribución conjunta
+xr <- range(rbind(m2_draws, m2_draws_hand)[, "beta"])
+xr[1] <- xr[1] - abs(diff(xr)) * 0.05
+xr[2] <- xr[2] + abs(diff(xr)) * 0.05
+
+yr <- range(rbind(m2_draws, m2_draws_hand)[, "alpha"])
+yr[1] <- yr[1] - abs(diff(yr)) * 0.05
+yr[2] <- yr[2] + abs(diff(yr)) * 0.05
+
+par(mfrow = c(1, 2))
+plot(m2_draws[, "alpha"] ~ m2_draws[, "beta"], main = "Stan",
+     ylab = expression(alpha), xlab = expression(beta),
+     col = rgb(0, 0, 0, 0.1), pch = 19, ylim = yr, xlim = xr)
+
+plot(m2_draws_hand[, "alpha"] ~ m2_draws_hand[, "beta"], main = "A mano",
+     ylab = expression(alpha), xlab = expression(beta),
+     col = rgb(0, 0, 0, 0.1), pch = 19, ylim = yr, xlim = xr)
+par(mfrow = c(1, 1))
+```
+
+Y mejor aún, con geom_hdr, que grafica regiones de máxima densidad
+
+```{r}
+dfdraws <- rbind(
+  m2_draws_hand |> as.data.frame(),
+  m2_draws[, c("alpha", "beta")] |> as.data.frame()
+)
+dfdraws$metodo <- rep(c("A mano", "Stan"), c(npost, nrow(m2_draws)))
+
+ggplot(dfdraws, aes(alpha, beta)) + 
+  geom_hdr(method = method_kde(adjust = 1.5), 
+           probs = c(0.99, seq(0.95, 0.05, by = -0.2), 0.05)) +
+  facet_wrap(vars(metodo), axes = "all", axis.labels = "margins") + 
+  nice_theme() + 
+  ylab(expression(beta)) + 
+  xlab(expression(alpha))
+```
+
+### Evaluación del ajuste
+
+Ahora que tenemos un modelo un poco más interesante, tiene sentido
+evaluar el ajuste mediante los residuos DHARMa. Los modelos estadísticos
+son generativos, es decir, permiten simular datos. Esto es gracias a que
+suponemos una distribución de probabilidad para las observaciones. Para
+evaluar el ajuste del modelo, comparamos datos simulados contra datos
+observados. En el contexto Bayesiano, esto se llama chequeo posterior
+predictivo (posterior predictive check), y si bien con el enfoque
+frecuentista se puede hacer algo similar, es un recurso poco explotado
+en ese ámbito. Lo bueno es que con simulaciones podemos calcular un tipo
+de residuo que tiene una distribución conocida bajo un buen ajuste,
+independientemente del modelo. Estos residuos son la probabilidad
+acumulada de cada dato en la distribución de datos simulados usando los
+mismos valores de las predictoras. Estos residuos tienen distribución
+uniforme en [0, 1] cuando el modelo ajusta bien y si la respuesta es
+continua, pero si no es continua, se los puede aleatorizar para que
+tengan esa misma propiedad. Por suerte Florian Hartig y sus amigos se
+encargaron de implementar estos residuos en el paquete DHARMa. Entonces,
+antes de evaluar los residuos necesitamos simular datos. Lo haremos con
+la estimación por maximum likelihood y con la estimación Bayesiana.
+
+```{r}
+nsim <- 1000 # nro de sets de datos a simular
+
+# Modelo estimado por maximum likelihood.
+coef_mle <- coef(m2_mle)
+ysim_mle <- matrix(NA, nrow(d), nsim)
+theta_fitted <- inv_logit(coef_mle["alpha"] + coef_mle["beta"] * d$z)
+for(i in 1:nsim) {
+  ysim_mle[, i] <- rbinom(n = nrow(d), size = 1, prob = theta_fitted)
+}
+
+# Modelo estimado con enfoque Bayesiano, con Stan
+ysim_stan <- matrix(NA, nrow(d), nsim)
+# para considerar incertidumbre, cada vez que simulamos datos tomaremos una
+# muestra de la posterior
+npost_stan <- nrow(m2_draws)
+# sorteamos 1000 muestras previamente
+ids_res <- sample(1:npost_stan, size = nsim, replace = F)
+for(i in 1:nsim) {
+  row <- ids_res[i]
+  theta_fitted_i <- inv_logit(
+    m2_draws[row, "alpha"] +
+    m2_draws[row, "beta"] * d$z
+  )
+  ysim_stan[, i] <- rbinom(n = nrow(d), size = 1, prob = theta_fitted_i)
+}
+
+# Calculamos residuos
+res2_mle <- createDHARMa(observedResponse = d$y,
+                         simulatedResponse = ysim_mle)
+res2_stan <- createDHARMa(observedResponse = d$y,
+                          simulatedResponse = ysim_stan)
+
+plot(res2_mle)
+plot(res2_stan)
+
+# Residuos en función de la predictora (z)
+plotResiduals(res2_mle, form = d$z, rank = F)
+plotResiduals(res2_stan, form = d$z, rank = F)
+```
+
+### Predicciones
+
+Luego de verificar que el modelo ajusta bien, graficamos predicciones.
+Arriba calculamos la probabilidad estimada para cada dato
+(`theta_fitted`), usando el valor observado de la predictora. Para
+visualizar la función ajustada por el modelo es más conveniente generar
+una secuencia de valores de z (predictora) y evaluar $\theta$ en cada
+valor, para graficar algo que se vea como continuo. Vamos por partes.
+
+Empezamos definiendo la secuencia de la predictora y calculando la
+predicción de $\theta$ según la estimación de $\alpha$ y $\beta$ por
+maximum likelihood.
+
+```{r}
+nseq <- 200
+zseq <- seq(0, 1, length.out = nseq)
+
+# La predicción basada en la estimación puntual es la siguiente:
+theta_pred_mle <- inv_logit(coef_mle["alpha"] + coef_mle["beta"] * zseq)
+```
+
+Pero eso no basta, necesitamos un intervalo de confianza. Una forma de
+obtener un intervalo aproximado es aproximar la incertidumbre con una
+distribución normal, esa misma con la que obtenemos el "Std. Error" de
+los coeficientes cuando hacemos `summary(m2_mle)`. Pero la aproximación
+normal puede ser válida sólo en la escala lineal, o sea, en la escala
+logit (el predictor lineal en la jerga de GLM):
+
+```{r}
+theta_logit <- coef_mle["alpha"] + coef_mle["beta"] * zseq
+```
+
+Calculando el standard error de la aproximación lineal podemos obtener
+el intervalo de confianza, y luego transformarlo a la escala de la
+probabilidad (inv_logit).
+
+```{r}
+V <- vcov(m2_mle)
+# matriz de varianza covarianza de la estimación 
+# (Normal Multivariada centrada en el MLE)
+
+X <- cbind(rep(1, nseq), zseq) 
+# matriz de diseño para la predicción
+
+theta_logit_se <- sqrt(diag(X %*% V %*% t(X))) 
+# standard error de la predicción.
+# Esto es lo que hace la función predict(..., se.fit = T)
+# cuando le pasamos un GLM.
+
+# Ponemos todo en un data.frame
+pred_mle <- data.frame(
+  z = zseq,
+  theta = theta_pred_mle,
+  theta_lower = inv_logit(theta_logit - qnorm(0.975) * theta_logit_se),
+  theta_upper = inv_logit(theta_logit + qnorm(0.975) * theta_logit_se)
+)
+
+ggplot(pred_mle, aes(z, theta, ymin = theta_lower, ymax = theta_upper)) +
+  geom_ribbon(color = NA, alpha = 0.3) +
+  geom_line() +
+  ylim(0, 1) +
+  ylab(expression(theta))
+```
+
+Con el enfoque bayesiano hay que hacer más cuentas, pero es
+conceptualmente más simple: calcular lo deseado con cada muestra de la
+posterior, y al final de todo resumir el resultado para plotear.
+
+```{r}
+# Como tenemos 4000 muestras, generaremos una matriz de predicciones con 4000
+# columnas
+theta_pred <- matrix(NA, nseq, npost_stan)
+# acá hacemos la misma cuenta para theta que hicimos arriba para simular datos,
+# pero usando zseq en vez de d$z
+for(i in 1:npost_stan) {
+  theta_pred[, i] <- inv_logit(m2_draws[i, "alpha"] +
+                               m2_draws[i, "beta"] * zseq)
+}
+```
+
+Cada fila de `theta_pred` contiene muestras de la distribución posterior
+de $\theta$, predicho para cada valor en `zseq`.
+
+```{r}
+plot(density(theta_pred[1, ]))
+plot(density(theta_pred[50, ]))
+```
+
+Y cada columna tiene una curva, correspondiente a los valores de
+$\alpha$ y $\beta$ de cada muestra.
+
+```{r}
+plot(theta_pred[, 1] ~ zseq, ylim = c(0, 1), ylab = expression(theta),
+     xlab = "z", col = rgb(0, 0, 0, 0.2), type = "l")
+for(i in sample(1:npost_stan, 20)) {
+  lines(theta_pred[, i] ~ zseq, col = rgb(0, 0, 0, 0.3))
+}
+```
+
+Y ahora resumimos la posterior de cada fila para hacer un gráfico de
+media e intervalo de credibilidad.
+
+```{r}
+pred_stan <- as.data.frame(cbind(
+ z = zseq,
+ apply(theta_pred, 1, mean_ci) |> t() # esto resume con media e ic
+))
+
+ggplot(pred_stan, aes(z, mean, ymin = lower, ymax = upper)) +
+  geom_ribbon(color = NA, alpha = 0.3) +
+  geom_line() +
+  ylim(0, 1) +
+  ylab(expression(theta))
+```
+
+Comparamos predicción frecuentista y Bayesiana.
+
+```{r}
+colnames(pred_stan) <- colnames(pred_mle)
+pred_stan$approach <- "Bayesiano"
+pred_mle$approach <- "Frecuentista"
+
+pred_bayentista <- rbind(pred_stan, pred_mle)
+ggplot(pred_bayentista,
+       aes(z, theta, ymin = theta_lower, ymax = theta_upper)) +
+  geom_ribbon(color = NA, alpha = 0.3) +
+  geom_line() +
+  facet_wrap(vars(approach), nrow = 1, axes = "all", axis.labels = "margins") +
+  ylim(0, 1) +
+  ylab(expression(theta)) +
+  nice_theme()
+```
+
+## Modelo 3: y \~ z, z \~ x, con z latente
+
+$$
+\begin{aligned}
+y_t &\sim \text{Bernoulli}(\theta_t) \\
+\\
+\theta_t &= \text{logit}^{-1}(\alpha + \beta \ z_t) \\
+z_t &=  z_{t-1} \\
+&\ \ \ \ \ + \iota \ (1 - z_{t-1}) \ x_{t-1} \\
+&\ \ \ \ \ - \delta \ z_{t-1} \ (1 - x_{t-1}) \\
+\\
+\alpha &\sim \text{Normal}(0, 5) \\
+\beta &\sim \text{Normal}(0, 2) \\
+\iota &\sim \text{Unif}(0, 1) \\
+\delta &\sim \text{Unif}(0, 1) \\
+z_1 &\sim \text{Unif}(0, 1) \\
+\end{aligned}
+$$
+
+Ahora no fingimos haber observado $z$, sino que la modelamos como
+latente. Esto implica estimar su estado inicial, $z_1$, por eso tiene
+una previa, además de los parámetros que regulan su dinámica ($\iota$ y
+$\delta$). En realidad los datos están agrupados en seguimientos, así
+que hay que estimar tantos $z1$ como seguimientos. En el set de datos
+simulados tenemos 30 seguimientos de 12 intervalos de duración cada uno
+(1 h).
+
+Como ahora tenemos muchos parámetros (en total, 34), no podemos hacer
+gráficos amigables fácilmente. Directamente tendremos que estimar el
+maximum likelihood con `mle2` y muestrear la posterior con Stan.
+
+```{r}
+## Ordenamos los datos en forma matricial
+nt <- max(d$t)
+nf <- max(d$grupo) # f de follow, seguimiento.
+
+y <- matrix(d$y, nt, nf)
+x <- matrix(d$x, nt, nf)
+# z es latente! no la vimos.
+
+# Función de likelihood
+ll3 <- function(params) {
+  # Extraemos los parámetros del vector params
+  alpha <- params[1]
+  beta <- params[2]
+  iota <- params[3]
+  delta <- params[4]
+  z1 <- params[5:(nf+4)]
+
+  # matriz de predictora latente
+  z <- matrix(NA, nt, nf)
+  z[1, ] <- z1           # primer estado se estima
+
+  theta <- matrix(NA, nt, nf) # cantidad derivada
+  theta[1, ] <- inv_logit(alpha + beta * z[1, ])
+
+  # Loop recursivo para calcular theta y z
+  for(t in 2:nt) {
+    # actualizamos z en base al ataque en el intervalo anterior
+    z[t, ] <-
+      z[t-1, ] +
+      iota * (1 - z[t-1, ]) * x[t-1, ] -  # ataque (aumenta)
+      delta * z[t-1, ] * (1 - x[t-1, ])   # no ataque (decrece)
+
+    theta[t, ] <- inv_logit(alpha + beta * z[t, ])
+  }
+
+  # vectorizamos theta, para calcular likelihood.
+  ll <- sum(dbinom(d$y, size = 1, prob = as.vector(theta), log = T))
+  return(ll)
+}
+
+# La negamos para mle2
+ll3_neg <- function(x) -ll3(x)
+
+# nombres
+parnames1 <- c("alpha", "beta", "iota", "delta")
+parnames2 <- paste("z1", 1:nf, sep = "_")
+parnames <- c(parnames1, parnames2)
+
+# valores iniciales
+start1 <- c(0, 1, 0.5, 0.5)
+start2 <- rep(0.5, nf) # para z1
+start <- c(start1, start2)
+names(start) <- parnames
+
+# bounds
+lower1 <- c(-Inf, -Inf, 0, 0)
+upper1 <- c(Inf, Inf, 1, 1)
+lower2 <- rep(0, nf)
+upper2 <- rep(1, nf)
+
+lower <- c(lower1, lower2)
+upper <- c(upper1, upper2)
+names(lower) <- names(upper) <- parnames
+
+# Estimamos
+parnames(ll3_neg) <- parnames
+m3_mle <- mle2(ll3_neg, start = start, parnames = parnames, vecpar = T,
+               lower = lower, upper = upper, method = "L-BFGS-B")
+summary(m3_mle) # Hay problemas. Mejor ser bayesianos (frecuentistas, ver
+                # la sección de likelihood penalizada).
+
+```
+
+Nos advierte que en el MLE varios parámetros están en el borde del rango
+permitido. Además, en el summary vemos que no se pudo calcular el Std.
+Error de muchos parámetros, indicando que la aproximación normal a la
+superficie de likelihood falló. Evidentemente, estimar modelos complejos
+con likelihood es desafiante. Para una posible solución ver la sección
+"Extra: likelihood penalizada". Ahora usaremos únicamente la estimación
+Bayesiana.
+
+### Muestreo de la posterior
+
+En Stan, definimos el modelo así:
+
+```{stan, output.var="tst_chunk", eval=FALSE}
+data {
+  int<lower=0> nt;
+  int<lower=0> nf;
+  array[nt*nf] int y;
+  array[nt, nf] int x;
+
+  // parámetros que definen las previas (conocidos, por eso van en data)
+  real alpha_mu;
+  real alpha_sigma;
+  real beta_mu;
+  real beta_sigma;
+}
+
+parameters {
+  real alpha;
+  real beta;
+  real<lower=0, upper=1> iota;
+  real<lower=0, upper=1> delta;
+  row_vector<lower=0, upper=1>[nf] z1;
+}
+
+transformed parameters {
+  matrix[nt, nf] theta;
+  matrix[nt, nf] z;     // z[2:nf, ] es una cantidad derivada, el único verdadero
+                        // parámetro es z[1, ] = z1
+
+  // formas vectorizadas
+  vector[nt*nf] theta_vec;
+  vector[nt*nf] z_vec;
+
+  // llenamos matrices z y theta
+  z[1, ] = z1;
+  theta[1, ] = inv_logit(alpha + beta * z1);
+
+  for(f in 1:nf) {
+    for(t in 2:nt) {
+      // actualizamos z en base al ataque en el intervalo anterior
+      z[t, f] =
+        z[t-1, f] +
+        iota * (1 - z[t-1, f]) * x[t-1, f] -   // ataque (aumenta)
+        delta * z[t-1, f] * (1 - x[t-1, f]);   // no ataque (decrece)
+
+      theta[t, f] = inv_logit(alpha + beta * z[t, f]);
+    }
+  }
+
+  // vectorizamos
+  theta_vec = to_vector(theta);
+  z_vec = to_vector(z);
+}
+
+model {
+  // Previas sobre los parámetros, no sobre theta
+  alpha ~ normal(alpha_mu, alpha_sigma);
+  beta ~ normal(beta_mu, beta_sigma);
+  // a iota, delta y z1 les dejamos previas planas = uniformes en [0, 1].
+  // No hace falta escribirlo.
+
+  // Likelihood
+  y ~ bernoulli(theta_vec);
+}
+```
+
+Compilamos y muestreamos.
+
+```{r}
+smodel3 <- stan_model("modelo3.stan", verbose = F)
+
+# preparamos datos
+sdata3 <- list(
+  nt = nt, nf = nf,
+  y = d$y, # vector
+  x = x,   # matriz
+
+  # previas
+  alpha_mu = alpha_mu,
+  alpha_sigma = alpha_sigma,
+  beta_mu = beta_mu,
+  beta_sigma = beta_sigma
+)
+
+# muestreamos
+m3 <- sampling(
+  smodel3, data = sdata3, seed = 9663,
+  cores = ncores, chains = 4, iter = 2000, warmup = 1000,
+  pars = c("alpha", "beta", "iota", "delta", "z1",
+           "z_vec", "theta_vec")
+)
+
+# Chequeamos convergencia y calidad de las muestras
+sm3 <- summary(m3)[[1]]
+min(sm3[, "n_eff"])
+max(sm3[, "Rhat"])
+```
+
+Miramos las marginales y comparamos con las previas.
+
+```{r}
+m3_draws <- as.matrix(m3)
+
+plot(density(m3_draws[, "alpha"]), main = NA, xlab = expression(alpha))
+curve(dnorm(x, alpha_mu, alpha_sigma), add = T, col = 2)
+
+plot(density(m3_draws[, "beta"]), main = NA, xlab = expression(beta))
+curve(dnorm(x, beta_mu, beta_sigma), add = T, col = 2)
+
+plot(density(m3_draws[, "iota"], from = 0, to = 1),
+     main = NA, xlab = expression(iota))
+curve(dunif(x, 0, 1), add = T, col = 2)
+
+plot(density(m3_draws[, "delta"], from = 0, to = 1),
+     main = NA, xlab = expression(delta))
+curve(dunif(x, 0, 1), add = T, col = 2)
+```
+
+La marginal para cada $z_1$:
+
+```{r}
+z1_draws <- m3_draws[, grep("z1", colnames(m3_draws))]
+colorcines <- viridis(nf, option = "H")
+
+plot(density(z1_draws[, 1], from = 0, to = 1, adjust = 1.5), main = NA, xlab = "z1",
+     ylim = c(0, 4.5), col = colorcines[1])
+for(i in 2:nf) {
+  lines(density(z1_draws[, i], from = 0, to = 1, adjust = 1.5),
+        col = colorcines[i])
+}
+curve(dunif(x, 0, 1), add = T, col = "black", lwd = 1.5, lty = 2)
+```
+
+Ahí vemos que las posteriores no difieren tanto de la previa. Eso es
+porque $z_1$ afecta únicamente a $y_1$ en cada seguimiento, y la
+likelihood es muy plana. ¿Pero qué pasa en t = 12?
+
+```{r}
+zvec_draws <- m3_draws[, grep("z_vec", colnames(m3_draws))]
+cols_nt <- d$t == nt
+znt <- zvec_draws[, cols_nt] # sólo los z para t = nt
+
+# Graficamos comparando z1 con z12.
+f <- sample(1:nf, size = 1) # muestreamos seguimiento
+
+dd1 <- density(z1_draws[, f], from = 0, to = 1)
+dd12 <- density(znt[, f], from = 0, to = 1)
+yy <- max(c(dd1$y, dd12$y))
+plot(dd1, ylim = c(0, yy), main = f, xlab = "z")
+lines(dd12, col = "red")
+```
+
+Como los $z_t$ son recursivos, arrastran información de toda la
+secuencia de $y$, por eso van acumulando información a mayor $t$,
+logrando separase del estado inicial y de la previa.
+
+### Evaluación del ajuste
+
+```{r}
+nsim <- 1000 # nro de sets de datos a simular
+ysim_stan <- matrix(NA, nrow(d), nsim)
+npost_stan <- nrow(m3_draws)
+z_draws <- m3_draws[, grep("z_vec", colnames(m3_draws))]
+
+ids_res <- sample(1:npost_stan, size = nsim, replace = F)
+for(i in 1:nsim) {
+  row <- ids_res[i]
+  theta_fitted_i <- inv_logit(
+    m3_draws[row, "alpha"] +
+    m3_draws[row, "beta"] * z_draws[row, ]
+  )
+  ysim_stan[, i] <- rbinom(n = nrow(d), size = 1, prob = theta_fitted_i)
+}
+
+res3_stan <- createDHARMa(observedResponse = d$y,
+                          simulatedResponse = ysim_stan)
+plot(res3_stan)
+
+# Residuos en función de la predictora (z)
+zhat <- colMeans(z_draws)
+plotResiduals(res3_stan, form = zhat, rank = F)
+```
+
+### Predicciones
+
+Primero, la dinámica de $y$ en función de $z$, igual que antes.
+
+```{r}
+nseq <- 200
+zseq <- seq(0, 1, length.out = nseq)
+theta_pred <- matrix(NA, nseq, npost_stan)
+
+for(i in 1:npost_stan) {
+  theta_pred[, i] <- inv_logit(m3_draws[i, "alpha"] +
+                                 m3_draws[i, "beta"] * zseq)
+}
+
+pred_stan <- as.data.frame(cbind(
+  z = zseq,
+  apply(theta_pred, 1, mean_ci) |> t() # esto resume con media e ic
+))
+
+ggplot(pred_stan, aes(z, mean, ymin = lower, ymax = upper)) +
+  geom_ribbon(color = NA, alpha = 0.3) +
+  geom_line() +
+  ylim(0, 1) +
+  ylab(expression(theta))
+```
+
+Pero es más interesante predecir cómo cambia el comportamiento ($y$) y
+el grado de disturbio ($z$) ante dos escenarios de ataque ($x$): (1)
+partiendo de un estado de calma, las ballenas son atacadas
+constantemente; (2) partiendo de un estado completamente disturbado, los
+ataques cesan.
+
+```{r}
+ntpred <- 18 # pasos para predecir
+
+zinc <- matrix(0, ntpred, npost_stan) # aumento
+zdec <- matrix(1, ntpred, npost_stan) # decaimiento
+
+tinc <- zinc # t por theta, prob de movimiento.
+tdec <- zinc
+
+iota_hat <- m3_draws[, "iota"]
+delta_hat <- m3_draws[, "delta"]
+alpha_hat <- m3_draws[, "alpha"]
+beta_hat <- m3_draws[, "beta"]
+
+# Iniciamos los theta
+tinc[1, ] <- inv_logit(alpha_hat + beta_hat * zinc[1, ]) # z = 1
+tdec[1, ] <- inv_logit(alpha_hat + beta_hat * zdec[1, ]) # z = 0
+
+for(t in 2:ntpred) {
+  # aumento bajo ataque constante
+  zinc[t, ] <- zinc[t-1, ] + iota_hat * (1 - zinc[t-1, ])
+  tinc[t, ] <- inv_logit(alpha_hat + beta_hat * zinc[t, ])
+
+  # decaimiento bajo ausencia de ataques
+  zdec[t, ] <- zdec[t-1, ] - delta_hat * zdec[t-1, ]
+  tdec[t, ] <- inv_logit(alpha_hat + beta_hat * zdec[t, ])
+}
+
+# Resumimos y ordenamos
+pred_z <- rbind(
+  apply(zinc, 1, mean_ci) |> t(),
+  apply(zdec, 1, mean_ci) |> t()
+) |> as.data.frame()
+pred_z$escenario <- rep(c("Ataque", "No ataque"), each = ntpred)
+pred_z$Tiempo <- (0:(ntpred-1)) * 5
+
+pred_theta <- rbind(
+  apply(tinc, 1, mean_ci) |> t(),
+  apply(tdec, 1, mean_ci) |> t()
+) |> as.data.frame()
+pred_theta$escenario <- rep(c("Ataque", "No ataque"), each = ntpred)
+pred_theta$Tiempo <- (0:(ntpred-1)) * 5
+
+# z 
+ggplot(pred_z, aes(Tiempo, mean, ymin = lower, ymax = upper,
+                   fill = escenario, color = escenario)) +
+  geom_ribbon(color = NA, alpha = 0.3) +
+  geom_line() +
+  geom_point() +
+  scale_color_viridis(discrete = T, option = "C", end = 0.5) +
+  scale_fill_viridis(discrete = T, option = "C", end = 0.5) +
+  nice_theme() +
+  theme(legend.title = element_blank()) +
+  ylab("z") +
+  xlab("Tiempo (min)") +
+  ylim(0, 1)
+
+# theta
+ggplot(pred_theta, aes(Tiempo, mean, ymin = lower, ymax = upper,
+                       fill = escenario, color = escenario)) +
+  geom_ribbon(color = NA, alpha = 0.3) +
+  geom_line() +
+  geom_point() +
+  scale_color_viridis(discrete = T, option = "C", end = 0.5) +
+  scale_fill_viridis(discrete = T, option = "C", end = 0.5) +
+  nice_theme() +
+  theme(legend.title = element_blank()) +
+  ylab(expression(theta)) +
+  xlab("Tiempo (min)") +
+  ylim(0, 1)
+```
+
+### Extra: likelihood penalizada
+
+En la estimación por likelihood de arriba pusimos límites a varios
+parámetros, pero suele ser mejor estimar todo en la escala no
+restringida, en parte porque la aproximación normal para calcular el
+error estándar se hace más razonable. Entonces, ahora transformamos
+$\iota$, $\delta$ y $z_1$ a la escala logit, para que puedan estar en
+($-\infty$, $\infty$). A la vez, para evitar que se vayan al infinito,
+usamos una likelihood penalizada. La estimación de máxima verosimilitud
+penalizada no minimiza $-\text{log}(p(y | \theta))$, sino que define
+como objetivo $-\text{log}(p(y | \theta)) + K$, donde $K$ es un término
+de penalidad diseñado de tal forma que evite que los parámetros se vayan
+a $\pm \infty$. Las formas más usadas de regularización en modelos de
+regresión múltiple son las conocidas como L1 y L2, utilizadas en LASSO
+(Least Angular Shrinkage and Selection Operator) y en Ridge Regression,
+respectivamente:
+
+$$
+\begin{aligned}
+K_{L1} &= \lambda \sum_{j=1}^J |\beta_j| \\
+K_{L2} &= \lambda \sum_{j=1}^J \beta_j^2 \\
+\end{aligned}
+$$ donde $\beta_j$ son los coeficientes de regresión, y $\lambda > 0$
+controla el grado de penalización, generalmente elegido mediante
+validación cruzada. De esta manera, para valores razonablemente altos de
+$\lambda$, la penalidad aumenta con el valor absoluto de los $\beta_j$,
+y no podemos tener un mínimo (óptimo) en $\beta_j = \pm \infty$. La
+menos-log-posterior,
+$$-\text{log}(p(\theta|y) = -\text{log}(p(\theta|y)) - \text{log}(p(\theta)),$$
+equivalente a la likelihood penalizada definiendo a la menos-log-previa
+como el término de penalidad: $$ K = -\text{log}(p(\theta)).$$ Si
+minimizamos la menos-log-posterior o maximizamos la log-posterior
+obtenemos el modo de la posterior, conocido como MAP, por Maximum a
+Posteriori. De esta manera, podemos pensar en estimar una likelihood
+penalizada o estimar el MAP de una posterior.
+
+En nuestro caso, los parámetros $\iota$, $\delta$ y $z_1$ deben estar en
+[0, 1], por lo que los transformaremos a la escala logit para que vivan
+en $(-\infty, \infty)$. Y como queremos asignarles una previa uniforme
+en su escala original, les asignaremos una previa logística en la escala
+logit. Sí, funciona:
+
+```{r}
+samples_unif <- runif(1e5, 0, 1)
+samples_logit <- logit(samples_unif)
+plot(density(samples_logit), lwd = 1.5, main = "Distribución logística")
+curve(dlogis(x), add = T, col = "red", lty = 2, lwd = 1.5)
+```
+
+Esto evitará que el algoritmo busque el óptimo en $\pm \infty$. A la
+vez, aproximar la incertidumbre con una normal multivariada será más
+razonable si no estamos contra el borde del espacio de parámetros.
+
+```{r}
+# Función de likelihood penalizada (similar a una posterior)
+ll3_pen <- function(params) {
+  # Extraemos los parámetros del vector params
+  alpha <- params[1]
+  beta <- params[2]       # alpha y beta sin penalizar
+  iota_logit <- params[3]
+  delta_logit <- params[4]
+  z1_logit <- params[5:(nf+4)]
+
+  # pasamos a la escala original para calcular la likelihood
+  iota <- inv_logit(iota_logit)
+  delta <- inv_logit(delta_logit)
+  z1 <- inv_logit(z1_logit)
+
+  # matriz de predictora latente
+  z <- matrix(NA, nt, nf)
+  z[1, ] <- z1           # primer estado se estima
+
+  theta <- matrix(NA, nt, nf) # cantidad derivada
+  theta[1, ] <- inv_logit(alpha + beta * z[1, ])
+
+  # Loop recursivo para calcular theta y z
+  for(t in 2:nt) {
+    # actualizamos z en base al ataque en el intervalo anterior
+    z[t, ] <-
+      z[t-1, ] +
+      iota * (1 - z[t-1, ]) * x[t-1, ] -  # ataque (aumenta)
+      delta * z[t-1, ] * (1 - x[t-1, ])   # no ataque (decrece)
+
+    theta[t, ] <- inv_logit(alpha + beta * z[t, ])
+  }
+
+  # vectorizamos theta, para calcular likelihood.
+  ll <- sum(dbinom(d$y, size = 1, prob = as.vector(theta), log = T))
+
+  # Ahora calculamos la log_previa, que sería el término de penalización
+  # pero sólo asignamos previa a los parámetros complicados:
+  # iota_logit, delta_logit y z1_logit
+  log_prior <-
+    dlogis(iota_logit, log = T) + dlogis(delta_logit, log = T) +
+    sum(dlogis(z1_logit, log = T))
+
+  return(ll + log_prior)
+}
+
+# La negamos para mle2
+ll3_pen_neg <- function(x) -ll3_pen(x)
+
+# valores iniciales
+start1 <- c(0, 1, 0, 0) # iota_logit y delta_logit empiezan en 0, que implica
+                        # iota = delta = 0.5
+start2 <- rep(0, nf)    # lo mismo para para z1_logit
+start <- c(start1, start2)
+names(start) <- parnames
+
+# Estimamos
+parnames(ll3_pen_neg) <- parnames
+
+m3_mle_pen <- mle2(ll3_pen_neg, start = start, parnames = parnames, vecpar = T,
+                   method = "BFGS")
+# No le damos lower y upper, porque ahora ningún parámetro está restringido.
+summary(m3_mle_pen) # Ahora tenemos el std.error para todos los parámetros.
+```

@@ -1,8 +1,8 @@
 data {
-  int n;
-  int y[n];
+  int<lower=0> n;
+  array[n] int y;
   vector[n] z;
-
+  
   // parámetros que definen las previas (conocidos, por eso van en data)
   real alpha_mu;
   real alpha_sigma;
