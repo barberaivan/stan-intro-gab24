@@ -1,9 +1,3 @@
----
-editor_options: 
-  markdown: 
-    wrap: 72
----
-
 # stan-intro-gab24
 
 ## Deconstruir el modelado no eStan complicado. Una introducción a Stan.
@@ -29,10 +23,15 @@ enfoque Bayesiano.
 
 Usaremos Stan desde R, en donde también estimaremos modelos maximizando
 la likelihood. Para seguir el taller se requieren los siguientes
-paquetes instalados: \* rstan \* bbmle \* DHARMa \* tidyverse \*
-ggdensity \* viridis
+paquetes instalados: 
+- rstan
+- bbmle
+- DHARMa
+- tidyverse
+- ggdensity
+- viridis.
 
 Se recomienda seguir el taller usando el archivo .Rmd. En caso de usar
-RStudio, lo ideal es tener una versión \>=1.4 para usar el modo de
-edición visual, así el texto se diferencia mejor del código y las
-ecuaciones se ven renderizadas y no en LaTeX.
+RStudio, lo ideal es tener una versión $\ge$ 1.4 para usar el modo de
+edición "visual", así el texto se diferencia mejor del código y las
+ecuaciones se ven como se debe.
