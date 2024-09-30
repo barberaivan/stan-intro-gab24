@@ -2,7 +2,7 @@
 
 ## Deconstruir el modelado no eStan complicado. Una introducción a Stan.
 
-Taller para la reunión del Grupo Argentino de Bioestadística 2024
+Taller para la [reunión del Grupo Argentino de Bioestadística 2024](https://gab.com.ar/reunion-cientifica-2024/)
 (Buenos Aires).
 
 Descripción:
