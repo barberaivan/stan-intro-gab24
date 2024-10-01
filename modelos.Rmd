@@ -547,7 +547,7 @@ para poder compararlas gráficamente.
 ```{r}
 # parámetros de la previa (para jugar, pero que ambos sean positivos)
 a <- 1
-b <- 6
+b <- 98
 
 prior <- dbeta(theta_seq, a, b)  # normalizada
 log_like <- ll1vec(theta_seq)    # no normalizada, porque no es una
@@ -1518,7 +1518,7 @@ validación cruzada. De esta manera, para valores razonablemente altos de
 $\lambda$, la penalidad aumenta con el valor absoluto de los $\beta_j$,
 y no podemos tener un mínimo (óptimo) en $\beta_j = \pm \infty$. La
 menos-log-posterior,
-$$-\text{log}(p(\theta|y) = -\text{log}(p(\theta|y)) - \text{log}(p(\theta)),$$
+$$-\text{log}(p(\theta|y) = -\text{log}(p(y|\theta)) - \text{log}(p(\theta)),$$
 equivalente a la likelihood penalizada definiendo a la menos-log-previa
 como el término de penalidad: $$ K = -\text{log}(p(\theta)).$$ Si
 minimizamos la menos-log-posterior o maximizamos la log-posterior
