@@ -193,7 +193,7 @@ l3 <- dnorm(1.1, mu_try, sigma_try)
 like = l1 * l2 * l3
 
 curve(dnorm(x, mu_try, sigma_try), from = -4, to = 4,
-      ylab = "Likelihood", xlab = "Y")
+      ylab = "Pr(Y = y)", xlab = "Y")
 abline(v = y, lty = 2)
 ```
 
@@ -239,21 +239,15 @@ cualquier valor de $\mu$ y $\sigma$:
 
 ```{r}
 
-target <- function(mu, sigma, like_only = F) {
+target <- function(mu, sigma) {
   log_like <- sum(dnorm(y, mu, sigma, log = T))
-  
-  if(like_only) {
-    return(log_like)
-  } else {
-    log_prior <- dnorm(mu, 0, 5, log = T) + dgamma(sigma, 2, 2, log = T)
-    log_posterior <- log_like + log_prior
-    return(log_posterior)
-  }
+  log_prior <- dnorm(mu, 0, 5, log = T) + dgamma(sigma, 2, 2, log = T)
+  log_posterior <- log_like + log_prior
+  return(log_posterior)
 }
 
 target(mu = 1, sigma = 100)
 target(mu = 1, sigma = 3)
-target(mu = 1, sigma = 3, like_only = T)
 ```
 
 ## Modelo 1: y \~ 1
@@ -666,7 +660,6 @@ m2_mle <- mle2(ll2_neg,                   # función de -log_likelihood
 # En este caso es absurdo poner límites, pero sirve de ejemplo.
 
 summary(m2_mle) # HAY ESTRELLITAS
-coef(m2_mle)
 bbmle::confint(m2_mle, level = 0.95)
 ```
 
@@ -740,6 +733,15 @@ ggplot(ptlong, aes(x = alpha, y = beta, fill = densidad)) +
 
 ### Muestreo de la posterior
 
+$$
+\begin{aligned}
+y_i &\sim \text{Bernoulli}(\theta_i) \\
+\theta_i &= \text{logit}^{-1}(\alpha + \beta \ z_i) \\
+\alpha &\sim \text{Normal}(0, 5) \\
+\beta &\sim \text{Normal}(0, 2)
+\end{aligned}
+$$
+
 Primero, a mano, con el método de la grilla.
 
 ```{r}
@@ -766,6 +768,7 @@ npost <- 10000
 ids_post <- sample(1:nrow(partable), size = npost, replace = T,
                    prob = partable$post)
 m2_draws_hand <- as.matrix(partable[ids_post, c("alpha", "beta")])
+head(m2_draws_hand)
 ```
 
 Y ahora, con Stan. Definimos el modelo así (guardado en `modelo2.stan`):
@@ -1124,7 +1127,6 @@ maximum likelihood con `mle2` y muestrear la posterior con Stan.
 nt <- max(d$t)
 nf <- max(d$grupo) # f de follow, seguimiento.
 
-y <- matrix(d$y, nt, nf)
 x <- matrix(d$x, nt, nf)
 # z es latente! no la vimos.
 
@@ -1186,6 +1188,7 @@ names(lower) <- names(upper) <- parnames
 
 # Estimamos
 parnames(ll3_neg) <- parnames
+
 m3_mle <- mle2(ll3_neg, start = start, parnames = parnames, vecpar = T,
                lower = lower, upper = upper, method = "L-BFGS-B")
 summary(m3_mle) # Hay problemas. Mejor ser bayesianos (frecuentistas, ver

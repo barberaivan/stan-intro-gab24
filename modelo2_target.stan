@@ -26,9 +26,9 @@ transformed parameters {
 
 model {
   // Previas sobre los parámetros, no sobre theta
-  alpha ~ normal(alpha_mu, alpha_sigma);
-  beta ~ normal(beta_mu, beta_sigma);
+  target += normal_lpdf(alpha | alpha_mu, alpha_sigma);
+  target += normal_lpdf(beta | beta_mu, beta_sigma);
 
   // Likelihood
-  y ~ bernoulli(theta);
+  target += bernoulli_lpmf(y | theta);
 }
