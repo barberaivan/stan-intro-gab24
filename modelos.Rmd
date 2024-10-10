@@ -139,6 +139,10 @@ $\boldsymbol{y} = \{0, 1, 0, 0, 0, 1, 1\}$.
 
 ```{r}
 y <- c(0, 1, 0, 0, 0, 1, 1)
+
+dbinom(y, size = 1, prob = 0.3)
+dbinom(y, size = 1, prob = 0.3) |> prod()
+
 nseq <- 300
 theta_seq <- seq(0, 1, length.out = nseq)
 like <- numeric(nseq)
@@ -238,16 +242,15 @@ También podemos crear una función que evalúe la log-posterior para
 cualquier valor de $\mu$ y $\sigma$:
 
 ```{r}
-
-target <- function(mu, sigma) {
+lpd_target <- function(mu, sigma) {
   log_like <- sum(dnorm(y, mu, sigma, log = T))
   log_prior <- dnorm(mu, 0, 5, log = T) + dgamma(sigma, 2, 2, log = T)
   log_posterior <- log_like + log_prior
   return(log_posterior)
 }
 
-target(mu = 1, sigma = 100)
-target(mu = 1, sigma = 3)
+lpd_target(mu = 1, sigma = 100)
+lpd_target(mu = 1, sigma = 3)
 ```
 
 ## Modelo 1: y \~ 1
@@ -691,6 +694,17 @@ ggplot(partable, aes(x = alpha, y = beta, fill = like_norm)) +
 
 Ahora graficaremos de esta forma la likelihood, la previa y la
 posterior. La idea es probar distintas previas, a ver qué efecto tienen.
+Por el momento definimos la siguiente previa (bastante informativa
+comparada con la original):
+
+$$
+\begin{aligned}
+y_i &\sim \text{Bernoulli}(\theta_i) \\
+\theta_i &= \text{logit}^{-1}(\alpha + \beta \ z_i) \\
+\alpha &\sim \text{Normal}(0, 0.25) \\
+\beta &\sim \text{Normal}(2, 0.25).
+\end{aligned}
+$$
 
 ```{r}
 # Parámetros de las previas
